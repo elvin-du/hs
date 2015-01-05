@@ -3,7 +3,6 @@ package database
 import (
 	"encoding/json"
 	"errors"
-	//"github.com/vuleetu/gorp"
 	"github.com/vuleetu/levelog"
 	"github.com/vuleetu/pools"
 	"github.com/ziutek/mymysql/autorc"
@@ -21,8 +20,8 @@ const MAX_TRIED = 3
 
 var memPool *pools.RoundRobin
 var (
-	mysqlPools   = map[string]*pools.RoundRobin{}
-	redisClients = map[string]*redis.Client{}
+	mysqlPools = map[string]*pools.RoundRobin{}
+	redisPools = map[string]*pools.RoundRobin{}
 )
 
 func Start() {
@@ -49,7 +48,6 @@ type MysqlResource struct {
 	kind string
 	db   *autorc.Conn
 	spec *MysqlSpec
-	//orm  *gorp.DbMap
 }
 
 func (r *MysqlResource) Db() *autorc.Conn {
@@ -193,6 +191,46 @@ func StartRedis() {
 	}
 }
 
+type RedisResource struct {
+	kind   string
+	client *redis.Client
+	spec   *RedisSpec
+}
+
+func (r *RedisResource) Client() *redis.Client {
+	return r.client
+}
+
+func (r *RedisResource) Close() {
+	r.client.Close()
+}
+
+func (r *RedisResource) IsClosed() bool {
+	return r.client.Ping().Err() != nil
+}
+
+func (r *RedisResource) Release() {
+	levelog.Info("release", r.kind, "resource")
+	mysqlPools[r.kind].Put(r)
+}
+
+func newRedisFactory(kind string, spec *RedisSpec) pools.Factory {
+	return func() (pools.Resource, error) {
+		var opt redis.Options
+		opt.Addr = spec.Addr
+		opt.DB = int64(spec.Db)
+		//opt.PoolSize = 1
+
+		client := redis.NewTCPClient(&opt)
+		err := client.Ping().Err()
+		if err != nil {
+			levelog.Fatal("Connect to redis failed", err, ", info", spec)
+		}
+
+		return &RedisResource{kind, client, spec}, err
+	}
+}
+
 func newRedisPool(name string, rawSpec YAML_MAP) {
 	var spec RedisSpec
 	err := unmarshal(rawSpec, &spec)
@@ -217,30 +255,82 @@ func newRedisPool(name string, rawSpec YAML_MAP) {
 	var opt redis.Options
 	opt.Addr = spec.Addr
 	opt.DB = int64(spec.Db)
-	opt.PoolSize = spec.Pool
+	//opt.PoolSize = spec.Pool
+	opt.PoolSize = 1
 
 	client := redis.NewTCPClient(&opt)
 	err = client.Ping().Err()
 	if err != nil {
 		levelog.Fatal("Connect to redis failed", err, ", info", spec)
 	}
+	client.Close()
 
-	redisClients[name] = client
+	p := pools.NewRoundRobin(spec.Pool, time.Minute*10)
+	p.Open(newRedisFactory(name, &spec))
+	redisPools[name] = p
 }
 
-func GetMRedis() (*redis.Client, error) {
+func GetMRedis() (*RedisResource, error) {
 	return GetRedis("master")
 }
 
-func GetRedis(name string) (*redis.Client, error) {
-	client, ok := redisClients[name]
+func GetRedis(name string) (*RedisResource, error) {
+	//hard code to master
+	masterPool, ok := redisPools[name]
 	if !ok {
-		levelog.Error("Pool not found: #", name, ", type: redis")
+		levelog.Error("Pool not found: #", name, ", type: mysql")
 		return nil, POOL_NOT_FOUND
 	}
 
-	levelog.Info("Got client, #", name, ", type: redis")
-	return client, nil
+	levelog.Info("#", name, "#", masterPool.StatsJSON(), ", type: mysql")
+	r, err := masterPool.Get()
+	if err != nil {
+		levelog.Error("Get resource from pool failed", err, "#", name, ", type: mysql")
+		return nil, err
+	}
+
+	mr, ok := r.(*RedisResource)
+	if !ok {
+		levelog.Error("Convert resource to mysql session failed, #", name, ", type: mysql")
+		return nil, TYPE_CONVERSION_FAILED
+	}
+
+	levelog.Info("Check if redis connection is alive, #", name)
+	var i = 0
+	for {
+		if i >= MAX_TRIED {
+			levelog.Error("Reconect reached maximum times:", i, "#", name)
+			return nil, errors.New("Can not establish connection to redis")
+		}
+
+		if err = mr.client.Ping().Err(); err != nil {
+			levelog.Warn("Ping failed", err, "#", name)
+			levelog.Warn("Try reconect, #", name)
+
+			var opt redis.Options
+			opt.Addr = mr.spec.Addr
+			opt.DB = int64(mr.spec.Db)
+			opt.PoolSize = 1
+
+			client := redis.NewTCPClient(&opt)
+			err = client.Ping().Err()
+			if err != nil {
+				levelog.Error("Connect to redis failed", err, ", info", mr.spec)
+				i++
+				continue
+			}
+
+			mr = &RedisResource{name, client, mr.spec}
+			break
+		}
+
+		levelog.Info("Ping success, #", name)
+		break
+	}
+
+	levelog.Info("Redis connection is alive now, #", name)
+	levelog.Info("Got resource, #", name)
+	return mr, nil
 }
 
 func unmarshal(data YAML_MAP, target interface{}) error {
