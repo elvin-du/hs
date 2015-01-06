@@ -9,7 +9,7 @@ mysql:
 
 redis:
   master:
-    addr: 122.226.73.141:6379
+    addr: localhost:6379
     pool: 100
 
 #log setup
